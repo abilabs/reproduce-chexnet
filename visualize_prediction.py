@@ -11,7 +11,10 @@ from skimage import io, transform
 from PIL import Image
 from pylab import *
 import seaborn as sns
-from matplotlib.pyplot import show 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import show
 
 # data science
 import numpy as np
@@ -22,6 +25,7 @@ import pandas as pd
 from copy import deepcopy
 import cxr_dataset as CXR
 import eval_model as E
+
 
 def calc_cam(x, label, model):
     """
@@ -85,13 +89,13 @@ def calc_cam(x, label, model):
     # pull weights corresponding to the 1024 layers from model
     weights = model.state_dict()['classifier.0.weight']
     weights = weights.cpu().numpy()
-    
+
     bias = model.state_dict()['classifier.0.bias']
     bias = bias.cpu().numpy()
-    
+
     # can replicate bottleneck and probability calculation here from last_layer network and params from
     # original network to ensure that reconstruction is accurate -- commented out as previously checked
-    
+
     #model_bn = deepcopy(model)
     #new_classifier = torch.nn.Sequential(*list(model_bn.classifier.children())[:-2])
     #model_bn.classifier = new_classifier
@@ -118,9 +122,9 @@ def calc_cam(x, label, model):
     cam+=bias[label_index]
 
     #make cam into local region probabilities with sigmoid
-    
+
     cam=1/(1+np.exp(-cam))
-    
+
     label_baseline_probs={
         'Atelectasis':0.103,
         'Cardiomegaly':0.025,
@@ -137,14 +141,22 @@ def calc_cam(x, label, model):
         'Pleural_Thickening':0.03,
         'Hernia':0.002
     }
-    
+
     #normalize by baseline probabilities
     cam = cam/label_baseline_probs[label]
-    
+
     #take log
     cam = np.log(cam)
-    
+
     return cam
+
+def recursion_change_bn(module):
+    if isinstance(module, torch.nn.BatchNorm2d):
+        module.track_running_stats = 1
+    else:
+        for i, (name, module1) in enumerate(module._modules.items()):
+            module1 = recursion_change_bn(module1)
+    return module
 
 def load_data(
         PATH_TO_IMAGES,
@@ -169,6 +181,8 @@ def load_data(
 
     checkpoint = torch.load(PATH_TO_MODEL, map_location=lambda storage, loc: storage)
     model = checkpoint['model']
+    for i, (name, module) in enumerate(model._modules.items()):
+        module = recursion_change_bn(model)
     del checkpoint
     model.cpu()
 
@@ -193,7 +207,7 @@ def load_data(
         'Hernia']
 
     data_transform = transforms.Compose([
-        transforms.Scale(224),
+        transforms.Resize(224),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
@@ -210,10 +224,12 @@ def load_data(
         transform=data_transform,
         finding=finding,
         starter_images=STARTER_IMAGES)
-    
+
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=1)
-    
+        dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    print("loaded the data successfully")
+
     return iter(dataloader), model
 
 
@@ -243,7 +259,7 @@ def show_next(dataloader, model, LABEL):
         'Fibrosis',
         'Pleural_Thickening',
         'Hernia']
-    
+
     label_index = next(
         (x for x in range(len(FINDINGS)) if FINDINGS[x] == LABEL))
 
@@ -253,49 +269,144 @@ def show_next(dataloader, model, LABEL):
     except StopIteration:
         print("All examples exhausted - rerun cells above to generate new examples to review")
         return None
-        
+
     # get cam map
     original = inputs.clone()
     raw_cam = calc_cam(inputs, LABEL, model)
-    
+
     # create predictions for label of interest and all labels
     pred = model(torch.autograd.Variable(original.cpu())).data.numpy()[0]
     predx = ['%.3f' % elem for elem in list(pred)]
-    
+
+    # switch backend in matplotlib
+    print("before plotting")
+    #
     fig, (showcxr,heatmap) =plt.subplots(ncols=2,figsize=(14,5))
-    
+
+    print("after")
+
     hmap = sns.heatmap(raw_cam.squeeze(),
             cmap = 'viridis',
             alpha = 0.3, # whole heatmap is translucent
             annot = True,
             zorder = 2,square=True,vmin=-5,vmax=5
             )
-    
-    cxr=inputs.numpy().squeeze().transpose(1,2,0)    
+
+    print("after hmap")
+    cxr=inputs.numpy().squeeze().transpose(1,2,0)
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
     cxr = std * cxr + mean
     cxr = np.clip(cxr, 0, 1)
-        
+
+    print("before imshow")
+
     hmap.imshow(cxr,
           aspect = hmap.get_aspect(),
           extent = hmap.get_xlim() + hmap.get_ylim(),
           zorder = 1) #put the map under the heatmap
     hmap.axis('off')
     hmap.set_title("P("+LABEL+")="+str(predx[label_index]))
-    
+
     showcxr.imshow(cxr)
     showcxr.axis('off')
     showcxr.set_title(filename[0])
     plt.savefig(str(LABEL+"_P"+str(predx[label_index])+"_file_"+filename[0]))
-    plt.show()
-    
-    
-        
+    imglocation = str(LABEL+"_P"+str(predx[label_index])+"_file_"+filename[0])
+    print("saved the image successfully")
+    print(imglocation)
+    #plt.show()
+    #plt.close()
+
+
     preds_concat=pd.concat([pd.Series(FINDINGS),pd.Series(predx),pd.Series(labels.numpy().astype(bool)[0])],axis=1)
     preds = pd.DataFrame(data=preds_concat)
     preds.columns=["Finding","Predicted Probability","Ground Truth"]
     preds.set_index("Finding",inplace=True)
     preds.sort_values(by='Predicted Probability',inplace=True,ascending=False)
-    
+
+    return preds, imglocation
+
+
+def show_single(dataloader, model, LABEL):
+    """
+    Plots CXR, activation map of CXR, and shows model probabilities of findings
+
+    Args:
+        dataloader: dataloader of test CXRs
+        model: fine-tuned torchvision densenet-121
+        LABEL: finding we're interested in seeing heatmap for
+    Returns:
+        None (plots output)
+    """
+    FINDINGS = [
+        'Atelectasis',
+        'Cardiomegaly',
+        'Effusion',
+        'Infiltration',
+        'Mass',
+        'Nodule',
+        'Pneumonia',
+        'Pneumothorax',
+        'Consolidation',
+        'Edema',
+        'Emphysema',
+        'Fibrosis',
+        'Pleural_Thickening',
+        'Hernia']
+
+    label_index = next(
+        (x for x in range(len(FINDINGS)) if FINDINGS[x] == LABEL))
+
+    # get next iter from dataloader
+    try:
+        inputs, labels, filename = next(dataloader)
+    except StopIteration:
+        print("All examples exhausted - rerun cells above to generate new examples to review")
+        return None
+
+    # get cam map
+    original = inputs.clone()
+    raw_cam = calc_cam(inputs, LABEL, model)
+
+    # create predictions for label of interest and all labels
+    pred = model(torch.autograd.Variable(original.cpu())).data.numpy()[0]
+    predx = ['%.3f' % elem for elem in list(pred)]
+
+    fig, (showcxr,heatmap) =plt.subplots(ncols=2,figsize=(14,5))
+
+    hmap = sns.heatmap(raw_cam.squeeze(),
+            cmap = 'viridis',
+            alpha = 0.3, # whole heatmap is translucent
+            annot = True,
+            zorder = 2,square=True,vmin=-5,vmax=5
+            )
+
+    cxr=inputs.numpy().squeeze().transpose(1,2,0)
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    cxr = std * cxr + mean
+    cxr = np.clip(cxr, 0, 1)
+
+    hmap.imshow(cxr,
+          aspect = hmap.get_aspect(),
+          extent = hmap.get_xlim() + hmap.get_ylim(),
+          zorder = 1) #put the map under the heatmap
+    hmap.axis('off')
+    hmap.set_title("P("+LABEL+")="+str(predx[label_index]))
+
+    showcxr.imshow(cxr)
+    showcxr.axis('off')
+    showcxr.set_title(filename[0])
+    plt.savefig(str(LABEL+"_P"+str(predx[label_index])+"_file_"+filename[0]))
+    plt.show()
+
+
+
+    preds_concat=pd.concat([pd.Series(FINDINGS),pd.Series(predx),pd.Series(labels.numpy().astype(bool)[0])],axis=1)
+    preds = pd.DataFrame(data=preds_concat)
+    preds.columns=["Finding","Predicted Probability","Ground Truth"]
+    preds.set_index("Finding",inplace=True)
+    preds.sort_values(by='Predicted Probability',inplace=True,ascending=False)
+
     return preds
